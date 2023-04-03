@@ -46,7 +46,48 @@
     <a class="btn btn-secondary" href="{{ url_for('index') }}">Back to Upload Page</a>
   </div>
 
+
+  <script>
+  const autosaveInterval = 5000; // Autosave every 5 seconds
+  const textareas = document.querySelectorAll('textarea[data-autosave]');
+
+  textareas.forEach((textarea) => {
+    let autosaveTimeout;
+
+    textarea.addEventListener('input', () => {
+      clearTimeout(autosaveTimeout);
+      autosaveTimeout = setTimeout(() => {
+        const formData = new FormData();
+        formData.append('audio_file', textarea.dataset.autosave);
+        formData.append('transcription', textarea.value);
+
+        fetch('{{ url_for("update_transcription") }}', {
+          method: 'POST',
+          body: formData,
+        });
+      }, autosaveInterval);
+    });
+  });
+</script>
+
+
   <style>
+  @media (max-width: 767px) {
+    .table-container {
+      max-height: unset;
+      overflow-y: unset;
+    }
+
+    .table {
+      white-space: normal;
+      table-layout: fixed;
+    }
+
+    .table-fixed thead th {
+      position: unset;
+    }
+  }
+        
     .table-fixed thead th {
       position: sticky;
       top: 0;
