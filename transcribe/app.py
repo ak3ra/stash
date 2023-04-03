@@ -17,7 +17,14 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_API_KEY)
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    response = supabase.table('transcriptions').select('audio_file_name, transcript').execute()
+    transcripts = response.data
+    return render_template('index.html', transcripts=transcripts)
+
+@app.route('/show_upload')
+def show_upload_action():
+    return render_template('upload.html')
+
 
 @app.route('/upload', methods=['POST'])
 def upload():
