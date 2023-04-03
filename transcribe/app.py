@@ -6,7 +6,7 @@ from flask import (
     url_for,
     send_from_directory,
     flash,
-    jsonify
+    jsonify,
 )
 
 
@@ -37,10 +37,9 @@ def serve(path):
 
 
 # Serve the static files from the static directory
-@app.route('/static/<path:path>')
+@app.route("/static/<path:path>")
 def send_static(path):
-    return send_from_directory('static', path)
-
+    return send_from_directory("static", path)
 
 
 @app.route("/")
