@@ -26,10 +26,15 @@ def upload():
         audio_file.save(os.path.join(app.config['UPLOAD_FOLDER'], audio_file.filename))
     return redirect(url_for('transcribe'))
 
+
 @app.route('/transcribe')
 def transcribe():
-    audio_files = os.listdir(app.config['UPLOAD_FOLDER'])
+    response = supabase.table('transcriptions').select('audio_file_name, transcript').execute()
+    transcripts = {file['audio_file_name']: file['transcript'] for file in response.data if not file['transcript']}
+    audio_files = [f for f in os.listdir(app.config['UPLOAD_FOLDER']) if f not in transcripts.keys()]
     return render_template('transcribe.html', audio_files=audio_files)
+
+
 
 @app.route('/uploads/<filename>')
 def uploaded_file(filename):
