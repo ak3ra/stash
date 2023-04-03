@@ -1,0 +1,58 @@
+{% extends 'base.html' %}
+
+{% block title %}
+  Audio Files List
+{% endblock %}
+
+{% block content %}
+  <div class="container mt-4">
+    <h1>List of Audio Files</h1>
+    <table class="table table-bordered table-fixed">
+      <thead>
+        <tr>
+          <th>Audio File Name</th>
+          <th>Audio Player</th>
+          <th>Transcription</th>
+          <th>Status</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for file in files %}
+          <tr>
+            <td>{{ file.audio_file_name }}</td>
+            <td>
+              <audio controls src="{{ url_for('uploaded_file', filename=file.audio_file_name) }}"></audio>
+            </td>
+            <td>
+              <form action="{{ url_for('update_transcription') }}" method="post">
+                <textarea class="form-control" name="transcription" rows="4">{{ file.transcript }}</textarea>
+                <input type="hidden" name="audio_file" value="{{ file.audio_file_name }}">
+                <input class="btn btn-primary btn-sm mt-2" type="submit" value="Update">
+              </form>
+            </td>
+            <td>{{ file.status }}</td>
+            <td>
+              <form action="{{ url_for('delete_transcription') }}" method="post">
+                <input type="hidden" name="audio_file" value="{{ file.audio_file_name }}">
+                <input class="btn btn-danger btn-sm" type="submit" value="Delete">
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <br>
+    <a class="btn btn-secondary" href="{{ url_for('index') }}">Back to Upload Page</a>
+  </div>
+
+  <style>
+    .table-fixed thead th {
+      position: sticky;
+      top: 0;
+      background-color: white;
+      z-index: 10;
+    }
+  </style>
+{% endblock %}
+
