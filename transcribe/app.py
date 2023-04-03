@@ -6,6 +6,7 @@ from flask import (
     url_for,
     send_from_directory,
     flash,
+    jsonify
 )
 
 
@@ -26,6 +27,22 @@ SUPABASE_API_KEY = os.getenv("SUPABASE_API_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_API_KEY)
 
 
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve(path):
+    if path != "" and os.path.exists(os.path.join("frontend/build", path)):
+        return send_from_directory("frontend/build", path)
+    else:
+        return send_from_directory("frontend/build", "index.html")
+
+
+# Serve the static files from the static directory
+@app.route('/static/<path:path>')
+def send_static(path):
+    return send_from_directory('static', path)
+
+
+
 @app.route("/")
 def index():
     response = (
@@ -35,12 +52,12 @@ def index():
     return render_template("index.html", transcripts=transcripts)
 
 
-@app.route("/show_upload")
+@app.route("/api/show_upload")
 def show_upload_action():
     return render_template("upload.html")
 
 
-@app.route("/upload", methods=["POST"])
+@app.route("/api/upload", methods=["POST"])
 def upload():
     audio_files = request.files.getlist("audio_files")
     for audio_file in audio_files:
@@ -48,7 +65,7 @@ def upload():
     return redirect(url_for("transcribe"))
 
 
-@app.route("/transcribe")
+@app.route("/api/transcribe")
 def transcribe():
     response = (
         supabase.table("transcriptions").select("audio_file_name, transcript").execute()
@@ -66,12 +83,12 @@ def transcribe():
     return render_template("transcribe.html", audio_files=audio_files)
 
 
-@app.route("/uploads/<filename>")
+@app.route("/api/uploads/<filename>")
 def uploaded_file(filename):
     return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
 
 
-@app.route("/list", methods=["GET", "POST"])
+@app.route("/api/list", methods=["GET", "POST"])
 def list_files():
     if request.method == "POST":
         updated_transcriptions = request.form.to_dict()
@@ -87,7 +104,7 @@ def list_files():
     return render_template("list.html", files=files)
 
 
-@app.route("/save_transcriptions", methods=["POST"])
+@app.route("/api/save_transcriptions", methods=["POST"])
 def save_transcriptions():
     transcriptions = request.form.to_dict()
     with open("transcriptions.csv", "w", newline="", encoding="utf-8") as csvfile:
@@ -110,7 +127,7 @@ def save_transcriptions():
     return redirect(url_for("index"))
 
 
-@app.route("/update_transcription", methods=["POST"])
+@app.route("/api/update_transcription", methods=["POST"])
 def update_transcription():
     audio_file = request.form["audio_file"]
     updated_transcription = request.form["transcription"]
@@ -123,7 +140,7 @@ def update_transcription():
     return redirect(url_for("list_files"))
 
 
-@app.route("/update_transcript/<string:audio_file_name>", methods=["POST"])
+@app.route("/api/update_transcript/<string:audio_file_name>", methods=["POST"])
 def update_transcript(audio_file_name):
     transcript = request.form.get("transcript")
     print(transcript)
@@ -146,7 +163,7 @@ def update_transcript(audio_file_name):
     return redirect(url_for("index"))
 
 
-@app.route("/delete_transcription", methods=["POST"])
+@app.route("/api/delete_transcription", methods=["POST"])
 def delete_transcription():
     audio_file = request.form["audio_file"]
     response = (

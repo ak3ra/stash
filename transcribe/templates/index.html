@@ -1,54 +1,63 @@
 {% extends 'base.html' %}
+
 {% block content %}
-    <div class="container mt-5">
-        <h1>Transcription Review</h1>
-        <form id="transcript-form" method="POST" action="{{ url_for('update_transcript', audio_file_name=transcripts[0].audio_file_name) }}">
-            <div class="card mt-3" style="width: 50%;">
-                <div class="card-body">
-                    <textarea class="form-control" id="transcript-textarea" name="transcript" rows="3">{{ transcripts[0].transcript }}</textarea>
-                    <audio id="audio-player" src="{{ url_for('uploaded_file', filename=transcripts[0].audio_file_name) }}" preload="auto"></audio>
+    <div id="root"></div>
+
+    <script src="{{ url_for('static', filename='js/react.development.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/react-dom.development.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/babel.min.js') }}"></script>
+
+    <script type="text/babel">
+        const transcripts = {{ transcripts | tojson }};
+        let currentIndex = 0;
+        const audioPlayer = document.getElementById('audio-player');
+        const transcriptTextarea = document.getElementById('transcript-textarea');
+        const transcriptForm = document.getElementById('transcript-form');
+
+        function togglePlay() {
+            if (audioPlayer.paused) {
+                audioPlayer.play();
+            } else {
+                audioPlayer.pause();
+            }
+        }
+
+        function navigate(step) {
+            audioPlayer.pause();
+            currentIndex += step;
+            if (currentIndex < 0) {
+                currentIndex = 0;
+            } else if (currentIndex >= transcripts.length) {
+                currentIndex = transcripts.length - 1;
+            }
+
+            audioPlayer.src = "{{ url_for('uploaded_file', filename='') }}" + transcripts[currentIndex].audio_file_name;
+            transcriptTextarea.textContent = transcripts[currentIndex].transcript;
+            transcriptForm.action = "{{ url_for('update_transcript', audio_file_name='') }}" + transcripts[currentIndex].audio_file_name;
+        }
+
+        function App() {
+            return (
+                <div className="container mt-5">
+                    <h1>Transcription Review</h1>
+                    <form id="transcript-form" method="POST" action="{{ url_for('update_transcript', audio_file_name=transcripts[0].audio_file_name) }}">
+                        <div className="card mt-3" style={{width: '50%'}}>
+                            <div className="card-body">
+                                <textarea className="form-control" id="transcript-textarea" name="transcript" rows="3">{transcripts[0].transcript}</textarea>
+                                <audio id="audio-player" src="{{ url_for('uploaded_file', filename=transcripts[0].audio_file_name) }}" preload="auto"></audio>
+                            </div>
+                        </div>
+                        <button type="submit" type="button" className="btn btn-primary">Save Changes</button>
+                        <button id="play-button" type="button" className="btn btn-primary" onClick={togglePlay}>Play</button>
+                        <button id="thumbs-up" type="button" className="btn btn-success">Thumbs Up</button>
+                        <button id="thumbs-down" type="button" className="btn btn-danger">Thumbs Down</button>
+                        <button id="prev-button" type="button" className="btn btn-secondary" onClick={() => navigate(-1)}>Previous</button>
+                        <button id="next-button" type="button" className="btn btn-secondary" onClick={() => navigate(1)}>Next</button>
+                    </form>
                 </div>
-            </div>
-            <button type="submit"  type="button" class="btn btn-primary">Save Changes</button>
-            <button id="play-button" type="button" class="btn btn-primary" onclick="togglePlay()">Play</button>
-            <button id="thumbs-up" type="button" class="btn btn-success">Thumbs Up</button>
-            <button id="thumbs-down" type="button" class="btn btn-danger">Thumbs Down</button>
-           <button id="prev-button" type="button" class="btn btn-secondary" onclick="navigate(-1)">Previous</button>
-           <button id="next-button" type="button" class="btn btn-secondary" onclick="navigate(1)">Next</button>
+            );
+        }
 
-        </form>
-
-<script>
-  let transcripts = {{ transcripts | tojson }};
-  let currentIndex = 0;
-  const audioPlayer = document.getElementById('audio-player');
-  const transcriptTextarea = document.getElementById('transcript-textarea'); // Add this line
-  const transcriptForm = document.getElementById('transcript-form'); // Add this line
-
-  function togglePlay() {
-    if (audioPlayer.paused) {
-      audioPlayer.play();
-    } else {
-      audioPlayer.pause();
-    }
-  }
-
-  function navigate(step) {
-    audioPlayer.pause();
-    currentIndex += step;
-    if (currentIndex < 0) {
-      currentIndex = 0;
-    } else if (currentIndex >= transcripts.length) {
-      currentIndex = transcripts.length - 1;
-    }
-
-    audioPlayer.src = "{{ url_for('uploaded_file', filename='') }}" + transcripts[currentIndex].audio_file_name;
-    transcriptTextarea.textContent = transcripts[currentIndex].transcript; // This line updates the transcript value
-    transcriptForm.action = "{{ url_for('update_transcript', audio_file_name='') }}" + transcripts[currentIndex].audio_file_name;
-  }
-</script>
-
-
-    <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.11.6/dist/umd/popper.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.min.js"></script>
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
 {% endblock %}
