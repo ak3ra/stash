@@ -1,2 +1,9 @@
 .env
 transcribe/.env
+.DS_Store
+transcribe/.DS_Store
+.DS_Store
+.gitignore
+transcribe/.DS_Store
+transcribe/.gitignore
+transcribe/.gitingore
