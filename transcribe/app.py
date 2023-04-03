@@ -48,7 +48,7 @@ def index():
         supabase.table("transcriptions").select("audio_file_name, transcript").execute()
     )
     transcripts = response.data
-    return render_template("index.html", transcripts=transcripts)
+    return app.send_static_file("index.html", transcripts=transcripts)
 
 
 @app.route("/api/show_upload")

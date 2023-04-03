@@ -1,37 +1,38 @@
-{% extends 'base.html' %}
-
-{% block title %}
-  Transcribe Audio Files
+{% extends 'base.html' %} {% block title %} Transcribe Audio Files {% endblock
+%} {% block content %}
+<div class="container mt-4">
+  <h1>Transcribe Audio Files</h1>
+  <form action="/save_transcriptions" method="post">
+    <table class="table table-bordered">
+      <thead>
+        <tr>
+          <th>Audio File Name</th>
+          <th>Audio Player</th>
+          <th>Transcription</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for audio_file in audio_files %}
+        <tr>
+          <td>{{ audio_file }}</td>
+          <td>
+            <audio
+              controls
+              src="{{ url_for('uploaded_file', filename=audio_file) }}"
+            ></audio>
+          </td>
+          <td>
+            <textarea
+              class="form-control"
+              name="{{ audio_file }}"
+              rows="4"
+            ></textarea>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <input class="btn btn-primary" type="submit" value="Save Transcriptions" />
+  </form>
+</div>
 {% endblock %}
-
-{% block content %}
-  <div class="container mt-4">
-    <h1>Transcribe Audio Files</h1>
-    <form action="/save_transcriptions" method="post">
-      <table class="table table-bordered">
-        <thead>
-          <tr>
-            <th>Audio File Name</th>
-            <th>Audio Player</th>
-            <th>Transcription</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for audio_file in audio_files %}
-            <tr>
-              <td>{{ audio_file }}</td>
-              <td>
-                <audio controls src="{{ url_for('uploaded_file', filename=audio_file) }}"></audio>
-              </td>
-              <td>
-                <textarea class="form-control" name="{{ audio_file }}" rows="4"></textarea>
-              </td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-      <input class="btn btn-primary" type="submit" value="Save Transcriptions">
-    </form>
-  </div>
-{% endblock %}
-
