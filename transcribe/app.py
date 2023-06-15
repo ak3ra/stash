@@ -174,6 +174,12 @@ def delete_transcription():
     return redirect(url_for("list_files"))
 
 
+@app.route("/api/print_all_names", methods=["GET"])
+def print_all_names():
+    response = supabase.table("transcriptions").select("*").execute()
+    return jsonify(response.data)
+
+
 if __name__ == "__main__":
     if not os.path.exists(app.config["UPLOAD_FOLDER"]):
         os.makedirs(app.config["UPLOAD_FOLDER"])
