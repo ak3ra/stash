@@ -48,4 +48,26 @@ $$
 Attention (QKV) = Softmax(\frac{QK^T}{\sqrt{d} + B})V
 $$
 
+## Variants
+
+They release 4 different Variants 
+- Swin-T: $C$ = 96, layer numbers $= {2,2,6,2}$
+- Swin-S: $C$ = 96, layer numbers $= {2,2,18,2}$
+- Swin-B: $C$ = 128, layer numbers $= {2,2,18,2}$
+- Swin-L: $C$ = 192, layer numbers $= {2,2,18,2}$
+
+Where $C$ denotes the channel number of the hidden layer in the first stage
+
+
+## Experiments
+### Datasets 
+
+**Human Action Recognition** 
+- Kinetics-400
+- Kinetics-600 
+
+**Temporal Modelling** 
+- Something-Something-V2
+
+
 
