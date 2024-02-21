@@ -29,8 +29,8 @@ This is my attempt to reproduce the works of Ze Liu et al. 2021
 As said earlier, they introduce a locality inductive bias to the self attention module which is effective in video recognition
 
 #### MSA on non overlapping windows
-01 - Given a video of $\prime T \times \prime H \times \prime W $ 3D tokens and the size of $P \times M \times M$, the windows are arranged to evenly partition the video input in a non overlapping manner 
-02 - MSA is performed within each non overlapping 3D window 
+- 01 - Given a video of $T^{'} \times H^{'} \times W^{'} $ 3D tokens and the size of $P \times M \times M$, the windows are arranged to evenly partition the video input in a non overlapping manner 
+- 02 - MSA is performed within each non overlapping 3D window 
 
 
 #### 3D shifted Windows
@@ -42,7 +42,7 @@ As said earlier, they introduce a locality inductive bias to the self attention 
 - As a result of this, SOTA is achieved on Kinetics and Something-Something-V2
 
 #### 3D Relative Bias 
-- Previous work said this is important, therefore they also do it $B \in \real^{p^{2} \times {M^2} \times M^2}$ for each head as 
+- Previous work said this is important, therefore they also do it $B \in \mathbb{R}^{p^{2} \times {M^2} \times M^2}$ for each head as 
 
 $$ 
 Attention (QKV) = Softmax(\frac{QK^T}{\sqrt{d} + B})V
