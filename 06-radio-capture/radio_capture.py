@@ -607,7 +607,7 @@ def main_radio_capture() -> None:
 
     config = RadioCaptureConfig(
         base_output_dir=Path(
-            "/content/drive/Shareddrives/Sunbird AI - Data/UG40/Processed_Data/ateso-only"
+            "/content/drive/path_to_output"
         ),
         duration_seconds=60 * 60,
         station_subfolder="etop-radio-audios",
