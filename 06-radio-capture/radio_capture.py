@@ -1,24 +1,32 @@
 """
 radio_capture.py
 ================
-Captures live radio streams with optional Voice Activity Detection (VAD)
+Captures live radio streams with a two-gate Voice Activity Detection (VAD)
 pre-screening so that recordings containing only music or adverts are skipped.
 
 VAD workflow
 ------------
-Before committing to a full (e.g. 1-hour) capture the code:
+Before committing to a full capture the code:
   1. Pulls a short sample (default 30 s) from the stream into memory as WAV.
+
+  Gate 1 — silero-VAD (speech presence)
   2. Runs silero-VAD on the sample and computes the fraction of frames that
-     are classified as speech.
-  3. If the ratio is below `VadConfig.speech_ratio_threshold` it waits a
-     random interval and retries (up to `max_retries` times).
-  4. Only when sufficient speech is detected does it start the full capture.
+     are classified as speech. Skips if below speech_ratio_threshold.
+
+  Gate 2 — spectral music rejection (librosa)
+  3. Computes spectral flatness and beat tempo on the same sample.
+     Music (including music with vocals) has a tonal/harmonic spectrum
+     (low spectral flatness) and a regular rhythmic pulse (detected tempo).
+     Skips if the sample looks like music even when Gate 1 passes.
+
+  4. If either gate fails, waits a random interval and retries.
+  5. Only when both gates pass does the full capture start.
 
 Dependencies (Colab)
 --------------------
-pip install soundfile
+pip install soundfile librosa
 # silero-vad is downloaded automatically from torch hub on first use.
-# torch / torchaudio are pre-installed in Colab.
+# torch / torchaudio / librosa / numpy / pandas are pre-installed in Colab.
 """
 from __future__ import annotations
 
@@ -51,6 +59,13 @@ try:
 except ImportError:
     _SF_AVAILABLE = False
 
+try:
+    import librosa
+    import numpy as np
+    _LIBROSA_AVAILABLE = True
+except ImportError:
+    _LIBROSA_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Manifest schema
@@ -68,6 +83,7 @@ MANIFEST_FIELDS = [
     "status",
     "error",
     "vad_speech_ratio",
+    "vad_music_score",
     "path",
 ]
 
@@ -86,48 +102,69 @@ class RadioStation:
 
 @dataclass(frozen=True)
 class VadConfig:
-    """Controls the Voice Activity Detection pre-screening step.
+    """Controls the two-gate Voice Activity Detection pre-screening step.
 
-    Attributes
-    ----------
+    Gate 1 — silero-VAD
+    -------------------
+    speech_ratio_threshold:
+        Minimum fraction of sample frames that silero-VAD must classify as
+        speech before Gate 2 is evaluated.
+        Music-heavy segments typically score < 0.2; dialogue typically > 0.5.
+        NOTE: Music with strong vocals (pop, gospel, R&B) can score 0.4–0.9
+        on silero alone — use music_rejection_enabled (Gate 2) to catch these.
+
+    Gate 2 — spectral music rejection (librosa)
+    -------------------------------------------
+    music_rejection_enabled:
+        Set to False to disable the spectral music gate entirely.
+    max_music_flatness:
+        If mean spectral flatness is below this value the sample is classified
+        as music and rejected. Speech has a noise-like (high-flatness) spectrum
+        (~0.07–0.25); music with instruments/vocals is tonal (low-flatness,
+        ~0.01–0.07).
+    music_tempo_min_bpm:
+        If a regular beat is detected above this tempo the sample is likely
+        music (nearly all music genres exceed 70 BPM; speech has no pulse).
+    max_flatness_with_tempo:
+        Combined rule: reject when flatness < this value AND detected tempo
+        exceeds music_tempo_min_bpm (catches vocal music whose flatness sits
+        in the ambiguous 0.05–0.10 zone).
+
+    Other
+    -----
     enabled:
         Set to False to bypass VAD entirely and always record.
     sample_duration_seconds:
         Length of the audio snippet sampled from the stream for analysis.
-        Longer samples give more reliable estimates but add latency.
-    speech_ratio_threshold:
-        Minimum fraction of sample frames that silero-VAD must classify
-        as speech before the full capture is started.
-        Music-heavy segments typically score < 0.2; dialogue typically > 0.4.
     max_retries:
-        How many sampling attempts to make before giving up on this
-        scheduling slot and skipping the station.
+        How many sampling attempts before giving up and skipping the station.
     min_retry_delay_seconds / max_retry_delay_seconds:
-        The actual wait between retries is chosen uniformly at random
-        from this range (adds jitter to avoid always hitting the same
-        part of the broadcast schedule).
+        Wait between retries is chosen uniformly at random from this range
+        so each attempt samples a different moment in the broadcast.
     silero_threshold:
-        Frame-level confidence threshold passed to silero-VAD's
-        ``get_speech_timestamps``.  Lower = more sensitive but more
-        false positives.
+        Per-frame confidence cutoff for silero-VAD. Lower = more sensitive.
     sample_rate:
-        Sample rate (Hz) used when resampling the snippet for VAD.
-        silero-VAD supports 8 000 Hz and 16 000 Hz.
+        Sample rate (Hz) for VAD analysis. silero-VAD supports 8 000 / 16 000.
     """
     enabled: bool = True
     sample_duration_seconds: int = 30
-    speech_ratio_threshold: float = 0.35
+    speech_ratio_threshold: float = 0.45
     max_retries: int = 3
     min_retry_delay_seconds: int = 30
     max_retry_delay_seconds: int = 120
     silero_threshold: float = 0.5
     sample_rate: int = 16_000
+    # Gate 2 — music rejection
+    music_rejection_enabled: bool = True
+    max_music_flatness: float = 0.05
+    music_tempo_min_bpm: float = 70.0
+    max_flatness_with_tempo: float = 0.10
 
 
 @dataclass(frozen=True)
 class RadioCaptureConfig:
     base_output_dir: Path
-    duration_seconds: int = 60 * 60
+    duration_seconds: int = 2 * 60   # 2-minute intervals by default
     audio_codec: str = "mp3"
     audio_bitrate: str = "128k"
     ffmpeg_loglevel: str = "warning"
@@ -239,7 +276,7 @@ def run_ffmpeg(command: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# VAD helpers
+# VAD helpers — Gate 1: silero-VAD (speech presence)
 # ---------------------------------------------------------------------------
 
 _silero_model_cache: tuple | None = None  # (model, utils)
@@ -273,8 +310,7 @@ def sample_audio_bytes(
     """Capture *duration_seconds* of audio from *station_url* as a WAV blob.
 
     Uses ffmpeg piping to stdout — nothing is written to disk.
-    The output is mono, resampled to *sample_rate* Hz, 16-bit PCM WAV.
-    Returns None if ffmpeg fails or produces no output.
+    Returns mono, *sample_rate* Hz, 16-bit PCM WAV, or None on failure.
     """
     cmd = [
         "ffmpeg", "-hide_banner", "-nostdin",
@@ -310,19 +346,9 @@ def compute_speech_ratio(
     wav_bytes: bytes,
     vad_cfg: VadConfig,
 ) -> float:
-    """Return the fraction of audio frames silero-VAD labels as speech.
+    """Return the fraction of audio frames silero-VAD labels as speech [0, 1].
 
-    Parameters
-    ----------
-    wav_bytes:
-        Raw WAV file content (bytes).
-    vad_cfg:
-        VAD configuration (used for sample_rate and silero_threshold).
-
-    Returns
-    -------
-    float in [0.0, 1.0] where 1.0 means the entire clip is speech.
-    Returns 0.0 on any error.
+    Returns 0.0 on any error (fail-safe: won't accidentally allow a capture).
     """
     if not _SF_AVAILABLE:
         raise RuntimeError(
@@ -338,8 +364,6 @@ def compute_speech_ratio(
         print(f"  VAD: could not decode WAV — {exc}")
         return 0.0
 
-    # Resample if the actual file SR doesn't match (shouldn't happen since
-    # ffmpeg already resampled, but guard anyway).
     if file_sr != vad_cfg.sample_rate:
         try:
             import torchaudio.functional as F_torchaudio
@@ -347,7 +371,7 @@ def compute_speech_ratio(
             tensor = F_torchaudio.resample(tensor, file_sr, vad_cfg.sample_rate)
             audio_array = tensor.squeeze(0).numpy()
         except Exception:
-            pass  # proceed with whatever rate we have
+            pass
 
     audio_tensor = torch.tensor(audio_array)
     total_frames = len(audio_array)
@@ -364,23 +388,110 @@ def compute_speech_ratio(
     return speech_frames / total_frames
 
 
-def stream_has_dialogue(
-    station_url: str,
-    vad_cfg: VadConfig,
-) -> tuple[bool, float]:
-    """Sample the live stream and decide whether dialogue is being broadcast.
+# ---------------------------------------------------------------------------
+# VAD helpers — Gate 2: spectral music rejection (librosa)
+# ---------------------------------------------------------------------------
 
-    Retries up to *vad_cfg.max_retries* times, each time waiting a random
-    delay in [min_retry_delay_seconds, max_retry_delay_seconds] before
-    re-sampling (mimics tuning in at different random moments).
+def compute_music_score(
+    wav_bytes: bytes,
+    vad_cfg: VadConfig,
+) -> float:
+    """Return a musiciness score in [0.0, 1.0] using librosa spectral features.
+
+    Two independent signals are combined:
+
+    1. Spectral flatness — a tonal/harmonic spectrum (music) has very low
+       flatness (~0.01–0.07); spoken dialogue is noise-like (high flatness,
+       ~0.07–0.25). Music with sung vocals sits at ~0.03–0.08.
+
+    2. Beat/tempo — music has a regular rhythmic pulse; conversation does not.
+       ``librosa.beat.beat_track`` estimates tempo in BPM.
+
+    Decision rules:
+      is_music = (flatness < max_music_flatness)
+                 OR (flatness < max_flatness_with_tempo AND tempo > music_tempo_min_bpm)
+
+    Returns 1.0 if music is detected, 0.0 otherwise.
+    Returns 0.0 (fail-open) on any error so music rejection never accidentally
+    blocks a real dialogue capture due to a librosa failure.
+    """
+    if not vad_cfg.music_rejection_enabled:
+        return 0.0
+    if not _LIBROSA_AVAILABLE:
+        print("  VAD Gate2: librosa not available — music check skipped.")
+        return 0.0
+    if not _SF_AVAILABLE:
+        return 0.0
+
+    try:
+        audio_array, _ = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+    except Exception as exc:
+        print(f"  VAD Gate2: could not decode WAV — {exc}")
+        return 0.0
+
+    try:
+        sr = vad_cfg.sample_rate
+
+        # Spectral flatness: shape (1, n_frames) — mean across all frames
+        flatness = librosa.feature.spectral_flatness(y=audio_array)
+        mean_flatness = float(np.mean(flatness))
+
+        # Beat / tempo detection
+        tempo_bpm, _ = librosa.beat.beat_track(y=audio_array, sr=sr)
+        tempo_bpm = float(tempo_bpm)
+
+        is_music_by_flatness = mean_flatness < vad_cfg.max_music_flatness
+        is_music_by_tempo = (
+            mean_flatness < vad_cfg.max_flatness_with_tempo
+            and tempo_bpm > vad_cfg.music_tempo_min_bpm
+        )
+        is_music = is_music_by_flatness or is_music_by_tempo
+
+        print(
+            f"  VAD Gate2: flatness={mean_flatness:.4f}  "
+            f"tempo={tempo_bpm:.1f} BPM  "
+            f"music={'YES — rejected' if is_music else 'no'}"
+        )
+        return 1.0 if is_music else 0.0
+
+    except Exception as exc:
+        print(f"  VAD Gate2: error computing music score — {exc}")
+        return 0.0
+
+
+def classify_audio(
+    wav_bytes: bytes,
+    vad_cfg: VadConfig,
+) -> tuple[float, float, bool]:
+    """Run both VAD gates on a WAV clip.
 
     Returns
     -------
-    (has_dialogue, best_speech_ratio)
-        has_dialogue — True if threshold was met on any attempt.
-        best_speech_ratio — highest speech ratio observed across all attempts.
+    (speech_ratio, music_score, is_music)
+    """
+    speech_ratio = compute_speech_ratio(wav_bytes, vad_cfg)
+    music_score = compute_music_score(wav_bytes, vad_cfg)
+    return speech_ratio, music_score, music_score >= 1.0
+
+
+def stream_has_dialogue(
+    station_url: str,
+    vad_cfg: VadConfig,
+) -> tuple[bool, float, float]:
+    """Sample the live stream and decide whether dialogue is being broadcast.
+
+    Gate 1: silero speech ratio must meet speech_ratio_threshold.
+    Gate 2: spectral analysis must NOT classify the clip as music.
+
+    Retries up to *vad_cfg.max_retries* times with a random delay between
+    attempts so each attempt samples a different moment in the broadcast.
+
+    Returns
+    -------
+    (has_dialogue, best_speech_ratio, best_music_score)
     """
     best_ratio = 0.0
+    best_music_score = 0.0
 
     for attempt in range(1, vad_cfg.max_retries + 1):
         print(
@@ -397,18 +508,22 @@ def stream_has_dialogue(
         if wav_bytes is None:
             print("  VAD: failed to capture sample — stream may be unavailable.")
         else:
-            ratio = compute_speech_ratio(wav_bytes, vad_cfg)
-            best_ratio = max(best_ratio, ratio)
+            speech_ratio, music_score, is_music = classify_audio(wav_bytes, vad_cfg)
+            best_ratio = max(best_ratio, speech_ratio)
+            best_music_score = max(best_music_score, music_score)
+
             print(
-                f"  VAD: speech ratio = {ratio:.1%}  "
+                f"  VAD Gate1: speech ratio = {speech_ratio:.1%}  "
                 f"(threshold = {vad_cfg.speech_ratio_threshold:.1%})"
             )
 
-            if ratio >= vad_cfg.speech_ratio_threshold:
+            if is_music:
+                print("  VAD: music detected by spectral analysis — skipping.")
+            elif speech_ratio < vad_cfg.speech_ratio_threshold:
+                print("  VAD: insufficient speech (likely silence / advert).")
+            else:
                 print("  VAD: dialogue detected — proceeding with capture.")
-                return True, best_ratio
-
-            print("  VAD: likely music / advert.")
+                return True, best_ratio, best_music_score
 
         if attempt < vad_cfg.max_retries:
             wait = random.randint(
@@ -422,7 +537,7 @@ def stream_has_dialogue(
         f"  VAD: no dialogue detected after {vad_cfg.max_retries} attempts — "
         "skipping capture."
     )
-    return False, best_ratio
+    return False, best_ratio, best_music_score
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +563,7 @@ def capture_station(
     station: RadioStation,
     config: RadioCaptureConfig,
 ) -> tuple[dict[str, object], bool]:
-    """Capture audio from *station*, optionally gated by VAD.
+    """Capture audio from *station*, gated by two-stage VAD.
 
     Returns
     -------
@@ -459,6 +574,7 @@ def capture_station(
     error = ""
     stop_requested = False
     vad_speech_ratio: float | None = None
+    vad_music_score: float | None = None
 
     print(f"\n=== Station: {station.language} / {station.label} ===")
 
@@ -468,18 +584,19 @@ def capture_station(
     vad_cfg = config.vad
     if vad_cfg.enabled:
         if not _TORCH_AVAILABLE or not _SF_AVAILABLE:
-            missing = []
-            if not _TORCH_AVAILABLE:
-                missing.append("torch")
-            if not _SF_AVAILABLE:
-                missing.append("soundfile")
+            missing = [
+                pkg for pkg, ok in [("torch", _TORCH_AVAILABLE), ("soundfile", _SF_AVAILABLE)]
+                if not ok
+            ]
             print(
                 f"  VAD: disabled — missing packages: {', '.join(missing)}. "
                 "Install them or set VadConfig(enabled=False) to suppress this warning."
             )
         else:
             try:
-                has_dialogue, vad_speech_ratio = stream_has_dialogue(station.url, vad_cfg)
+                has_dialogue, vad_speech_ratio, vad_music_score = stream_has_dialogue(
+                    station.url, vad_cfg
+                )
             except KeyboardInterrupt:
                 return (
                     {
@@ -494,27 +611,31 @@ def capture_station(
                         "status": "interrupted",
                         "error": "KeyboardInterrupt during VAD",
                         "vad_speech_ratio": vad_speech_ratio,
+                        "vad_music_score": vad_music_score,
                         "path": "",
                     },
                     True,
                 )
 
             if not has_dialogue:
-                row = {
-                    "timestamp_utc": ts,
-                    "language": station.language,
-                    "station_id": station.station_id,
-                    "label": station.label,
-                    "url": station.url,
-                    "requested_duration_sec": config.duration_seconds,
-                    "actual_duration_sec": None,
-                    "bytes": 0,
-                    "status": "vad_skipped",
-                    "error": "No dialogue detected by VAD",
-                    "vad_speech_ratio": vad_speech_ratio,
-                    "path": "",
-                }
-                return row, False
+                return (
+                    {
+                        "timestamp_utc": ts,
+                        "language": station.language,
+                        "station_id": station.station_id,
+                        "label": station.label,
+                        "url": station.url,
+                        "requested_duration_sec": config.duration_seconds,
+                        "actual_duration_sec": None,
+                        "bytes": 0,
+                        "status": "vad_skipped",
+                        "error": "No dialogue detected by VAD",
+                        "vad_speech_ratio": vad_speech_ratio,
+                        "vad_music_score": vad_music_score,
+                        "path": "",
+                    },
+                    False,
+                )
 
     # ------------------------------------------------------------------
     # Full capture
@@ -550,6 +671,7 @@ def capture_station(
         "status": status,
         "error": error,
         "vad_speech_ratio": vad_speech_ratio,
+        "vad_music_score": vad_music_score,
         "path": str(out_path),
     }
     return row, stop_requested
@@ -574,6 +696,91 @@ def capture_radio_streams(
             break
 
     return rows, manifest_path
+
+
+# ---------------------------------------------------------------------------
+# Playback helper
+# ---------------------------------------------------------------------------
+
+def listen_to_captures(
+    manifest_path: str | Path,
+    n: int = 1,
+    status_filter: str = "ok",
+) -> None:
+    """Play back the most recent *n* successful captures inline in a notebook.
+
+    Parameters
+    ----------
+    manifest_path:
+        Path to the CSV manifest written by ``capture_radio_streams``.
+    n:
+        Number of recordings to play back, starting from the most recent.
+        Pass n=-1 to play all matching rows.
+    status_filter:
+        Only rows whose ``status`` column matches this value are shown.
+        Default is ``"ok"`` (successful captures only).
+
+    Example
+    -------
+    listen_to_captures(manifest_path, n=3)
+    """
+    try:
+        import pandas as pd
+        from IPython.display import Audio, display
+    except ImportError as exc:
+        raise ImportError(
+            "listen_to_captures requires pandas and IPython. "
+            "In Colab both are pre-installed."
+        ) from exc
+
+    manifest_path = Path(manifest_path)
+    if not manifest_path.exists():
+        print(f"Manifest not found: {manifest_path}")
+        return
+
+    df = pd.read_csv(
+        manifest_path,
+        header=None,
+        names=MANIFEST_FIELDS,
+        engine="python",
+    )
+
+    # Drop the header row if the CSV was written with one
+    if not df.empty and list(df.iloc[0].values) == MANIFEST_FIELDS:
+        df = df.iloc[1:].reset_index(drop=True)
+
+    filtered = df[df["status"] == status_filter]
+
+    if filtered.empty:
+        print(f"No captures with status='{status_filter}' found in {manifest_path}")
+        return
+
+    rows_to_play = filtered.tail(n) if n != -1 else filtered
+    rows_to_play = rows_to_play[::-1]  # most recent first
+
+    for _, row in rows_to_play.iterrows():
+        audio_path = Path(str(row["path"]))
+        if not audio_path.exists():
+            print(f"File not found, skipping: {audio_path}")
+            continue
+        label = (
+            f"{row.get('label', '')} | {row.get('timestamp_utc', '')} | "
+            f"{row.get('actual_duration_sec', '?')}s"
+        )
+        speech_pct = row.get("vad_speech_ratio")
+        music_score = row.get("vad_music_score")
+        if speech_pct not in (None, ""):
+            try:
+                label += f" | speech={float(speech_pct):.1%}"
+            except (ValueError, TypeError):
+                pass
+        if music_score not in (None, ""):
+            try:
+                label += f" | music_score={float(music_score):.2f}"
+            except (ValueError, TypeError):
+                pass
+        print(label)
+        display(Audio(str(audio_path)))
 
 
 # ---------------------------------------------------------------------------
@@ -609,15 +816,19 @@ def main_radio_capture() -> None:
         base_output_dir=Path(
             "/content/drive/path_to_output"
         ),
-        duration_seconds=60 * 60,
+        duration_seconds=2 * 60,      # 2-minute intervals
         station_subfolder="etop-radio-audios",
         vad=VadConfig(
             enabled=True,
-            sample_duration_seconds=30,   # sample 30 s before deciding
-            speech_ratio_threshold=0.35,  # 35 % of sample must be speech
+            sample_duration_seconds=30,
+            speech_ratio_threshold=0.45,   # raised from 0.35
             max_retries=3,
-            min_retry_delay_seconds=30,   # wait 30–120 s between retries
+            min_retry_delay_seconds=30,
             max_retry_delay_seconds=120,
+            music_rejection_enabled=True,  # Gate 2: spectral music rejection
+            max_music_flatness=0.05,
+            music_tempo_min_bpm=70.0,
+            max_flatness_with_tempo=0.10,
         ),
     )
 
@@ -632,6 +843,9 @@ def main_radio_capture() -> None:
 
     rows, manifest_path = capture_radio_streams(stations=stations, config=config)
     print_capture_summary(rows=rows, manifest_path=manifest_path)
+
+    # Play back the most recent successful capture in the notebook
+    listen_to_captures(manifest_path, n=1)
 
 
 if __name__ == "__main__":
