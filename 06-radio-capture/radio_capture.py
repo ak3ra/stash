@@ -14,9 +14,9 @@ Before committing to a full capture the code:
      are classified as speech. Skips if below speech_ratio_threshold.
 
   Gate 2 — spectral music rejection (librosa)
-  3. Computes spectral flatness and beat tempo on the same sample.
-     Music (including music with vocals) has a tonal/harmonic spectrum
-     (low spectral flatness) and a regular rhythmic pulse (detected tempo).
+  3. Computes spectral flatness (mean AND std) on the same sample.
+     Music has a tonal/harmonic spectrum (low flatness) that stays steady
+     across frames (low flatness std).  Speech modulates much more (high std).
      Skips if the sample looks like music even when Gate 1 passes.
 
   4. If either gate fails, waits a random interval and retries.
@@ -118,17 +118,20 @@ class VadConfig:
     music_rejection_enabled:
         Set to False to disable the spectral music gate entirely.
     max_music_flatness:
-        If mean spectral flatness is below this value the sample is classified
-        as music and rejected. Speech has a noise-like (high-flatness) spectrum
-        (~0.07–0.25); music with instruments/vocals is tonal (low-flatness,
-        ~0.01–0.07).
-    music_tempo_min_bpm:
-        If a regular beat is detected above this tempo the sample is likely
-        music (nearly all music genres exceed 70 BPM; speech has no pulse).
-    max_flatness_with_tempo:
-        Combined rule: reject when flatness < this value AND detected tempo
-        exceeds music_tempo_min_bpm (catches vocal music whose flatness sits
-        in the ambiguous 0.05–0.10 zone).
+        If mean spectral flatness is below this value the sample is clearly
+        tonal/musical and rejected outright.  Pure instrumental music sits
+        at ~0.01–0.03; speech is ~0.05–0.25.
+    max_music_flatness_dynamic:
+        Upper flatness bound for the flatness-steadiness rule (see below).
+        If flatness is below this AND the spectrum is very steady (low std),
+        the sample is classified as music.  This catches music-with-vocals
+        whose mean flatness sits in the ambiguous 0.03–0.06 zone.
+    max_music_flatness_std:
+        Maximum standard deviation of spectral flatness for the steadiness
+        rule.  Music keeps a relatively constant spectral profile across
+        frames (low std ~0.01); speech modulates heavily as phonemes change
+        (high std ~0.02–0.04).  Dialogue over a music bed also has high std
+        because the speaker's voice varies the spectrum.
 
     Other
     -----
@@ -156,9 +159,9 @@ class VadConfig:
     sample_rate: int = 16_000
     # Gate 2 — music rejection
     music_rejection_enabled: bool = True
-    max_music_flatness: float = 0.05
-    music_tempo_min_bpm: float = 70.0
-    max_flatness_with_tempo: float = 0.10
+    max_music_flatness: float = 0.03
+    max_music_flatness_dynamic: float = 0.06
+    max_music_flatness_std: float = 0.02
 
 
 @dataclass(frozen=True)
@@ -395,83 +398,79 @@ def compute_speech_ratio(
 def compute_music_score(
     wav_bytes: bytes,
     vad_cfg: VadConfig,
-) -> float:
-    """Return a musiciness score in [0.0, 1.0] using librosa spectral features.
+) -> tuple[float, dict]:
+    """Analyse spectral features and decide if the audio is music.
 
-    Two independent signals are combined:
+    Uses two rules based on spectral flatness:
 
-    1. Spectral flatness — a tonal/harmonic spectrum (music) has very low
-       flatness (~0.01–0.07); spoken dialogue is noise-like (high flatness,
-       ~0.07–0.25). Music with sung vocals sits at ~0.03–0.08.
+    Rule 1 — very low flatness (< max_music_flatness):
+        The spectrum is clearly tonal/harmonic → pure instrumental music.
 
-    2. Beat/tempo — music has a regular rhythmic pulse; conversation does not.
-       ``librosa.beat.beat_track`` estimates tempo in BPM.
+    Rule 2 — moderate flatness (< max_music_flatness_dynamic)
+             AND steady spectrum (flatness std < max_music_flatness_std):
+        The spectrum is moderately tonal AND doesn't modulate across frames.
+        Music keeps a steady spectral profile; speech modulates heavily.
+        This catches music-with-vocals in the ambiguous flatness zone.
 
-    Decision rules:
-      is_music = (flatness < max_music_flatness)
-                 OR (flatness < max_flatness_with_tempo AND tempo > music_tempo_min_bpm)
-
-    Returns 1.0 if music is detected, 0.0 otherwise.
-    Returns 0.0 (fail-open) on any error so music rejection never accidentally
-    blocks a real dialogue capture due to a librosa failure.
+    Returns
+    -------
+    (score, diagnostics)
+        score — 1.0 if music detected, 0.0 otherwise.
+        diagnostics — dict with mean_flatness, flatness_std, tempo_bpm
+                      (tempo is diagnostic-only, not used in the decision).
     """
+    empty_diag: dict = {"mean_flatness": 0.0, "flatness_std": 0.0, "tempo_bpm": 0.0}
+
     if not vad_cfg.music_rejection_enabled:
-        return 0.0
+        return 0.0, empty_diag
     if not _LIBROSA_AVAILABLE:
         print("  VAD Gate2: librosa not available — music check skipped.")
-        return 0.0
+        return 0.0, empty_diag
     if not _SF_AVAILABLE:
-        return 0.0
+        return 0.0, empty_diag
 
     try:
         audio_array, _ = sf.read(io.BytesIO(wav_bytes), dtype="float32")
     except Exception as exc:
         print(f"  VAD Gate2: could not decode WAV — {exc}")
-        return 0.0
+        return 0.0, empty_diag
 
     try:
         sr = vad_cfg.sample_rate
 
-        # Spectral flatness: shape (1, n_frames) — mean across all frames
+        # Spectral flatness: shape (1, n_frames)
         flatness = librosa.feature.spectral_flatness(y=audio_array)
         mean_flatness = float(np.mean(flatness))
+        flatness_std = float(np.std(flatness))
 
-        # Beat / tempo detection
-        tempo_bpm, _ = librosa.beat.beat_track(y=audio_array, sr=sr)
-        tempo_bpm = float(tempo_bpm)
+        # Beat / tempo (diagnostic only — beat_track finds tempo in anything,
+        # including speech, so it's unreliable as a decision signal)
+        tempo_result, _ = librosa.beat.beat_track(y=audio_array, sr=sr)
+        tempo_bpm = float(np.atleast_1d(tempo_result)[0])
 
+        diag = {
+            "mean_flatness": mean_flatness,
+            "flatness_std": flatness_std,
+            "tempo_bpm": tempo_bpm,
+        }
+
+        # Rule 1: very tonal spectrum → clearly music
         is_music_by_flatness = mean_flatness < vad_cfg.max_music_flatness
-        is_music_by_tempo = (
-            mean_flatness < vad_cfg.max_flatness_with_tempo
-            and tempo_bpm > vad_cfg.music_tempo_min_bpm
-        )
-        is_music = is_music_by_flatness or is_music_by_tempo
 
-        print(
-            f"  VAD Gate2: flatness={mean_flatness:.4f}  "
-            f"tempo={tempo_bpm:.1f} BPM  "
-            f"music={'YES — rejected' if is_music else 'no'}"
+        # Rule 2: moderately tonal + steady spectrum → music (even with vocals)
+        # Speech modulates spectral flatness heavily (phonemes, pauses);
+        # music keeps it relatively constant.
+        is_music_by_steadiness = (
+            mean_flatness < vad_cfg.max_music_flatness_dynamic
+            and flatness_std < vad_cfg.max_music_flatness_std
         )
-        return 1.0 if is_music else 0.0
+
+        is_music = is_music_by_flatness or is_music_by_steadiness
+        return (1.0 if is_music else 0.0), diag
 
     except Exception as exc:
         print(f"  VAD Gate2: error computing music score — {exc}")
-        return 0.0
-
-
-def classify_audio(
-    wav_bytes: bytes,
-    vad_cfg: VadConfig,
-) -> tuple[float, float, bool]:
-    """Run both VAD gates on a WAV clip.
-
-    Returns
-    -------
-    (speech_ratio, music_score, is_music)
-    """
-    speech_ratio = compute_speech_ratio(wav_bytes, vad_cfg)
-    music_score = compute_music_score(wav_bytes, vad_cfg)
-    return speech_ratio, music_score, music_score >= 1.0
+        return 0.0, empty_diag
 
 
 def stream_has_dialogue(
@@ -508,21 +507,34 @@ def stream_has_dialogue(
         if wav_bytes is None:
             print("  VAD: failed to capture sample — stream may be unavailable.")
         else:
-            speech_ratio, music_score, is_music = classify_audio(wav_bytes, vad_cfg)
+            # Gate 1 — silero speech detection
+            speech_ratio = compute_speech_ratio(wav_bytes, vad_cfg)
             best_ratio = max(best_ratio, speech_ratio)
-            best_music_score = max(best_music_score, music_score)
-
             print(
                 f"  VAD Gate1: speech ratio = {speech_ratio:.1%}  "
                 f"(threshold = {vad_cfg.speech_ratio_threshold:.1%})"
             )
 
+            # Gate 2 — spectral music rejection
+            music_score, diag = compute_music_score(wav_bytes, vad_cfg)
+            best_music_score = max(best_music_score, music_score)
+            is_music = music_score >= 1.0
+            mf = diag["mean_flatness"]
+            fs = diag["flatness_std"]
+            tp = diag["tempo_bpm"]
+            print(
+                f"  VAD Gate2: flatness={mf:.4f} (std={fs:.4f})  "
+                f"tempo={tp:.0f} BPM  "
+                f"music={'YES — rejected' if is_music else 'no'}"
+            )
+
+            # Decision
             if is_music:
-                print("  VAD: music detected by spectral analysis — skipping.")
+                print("  VAD result: music detected — skipping.")
             elif speech_ratio < vad_cfg.speech_ratio_threshold:
-                print("  VAD: insufficient speech (likely silence / advert).")
+                print("  VAD result: insufficient speech (likely silence / advert).")
             else:
-                print("  VAD: dialogue detected — proceeding with capture.")
+                print("  VAD result: dialogue detected — proceeding with capture.")
                 return True, best_ratio, best_music_score
 
         if attempt < vad_cfg.max_retries:
@@ -738,18 +750,34 @@ def listen_to_captures(
         print(f"Manifest not found: {manifest_path}")
         return
 
-    df = pd.read_csv(
-        manifest_path,
-        header=None,
-        names=MANIFEST_FIELDS,
-        engine="python",
-    )
+    # Read CSV with auto-detected header (handles both old 12-col and new
+    # 13-col schemas gracefully).
+    try:
+        df = pd.read_csv(manifest_path)
+    except Exception:
+        print(
+            f"Could not parse manifest — it may have mixed schemas. "
+            f"Consider deleting {manifest_path} and re-running."
+        )
+        return
 
-    # Drop the header row if the CSV was written with one
-    if not df.empty and list(df.iloc[0].values) == MANIFEST_FIELDS:
-        df = df.iloc[1:].reset_index(drop=True)
+    # Ensure required columns exist
+    if "status" not in df.columns or "path" not in df.columns:
+        print("Manifest is missing required columns (status, path)")
+        return
 
-    filtered = df[df["status"] == status_filter]
+    # Add optional columns if they don't exist (old schema compat)
+    for col in ("vad_speech_ratio", "vad_music_score", "label",
+                "timestamp_utc", "actual_duration_sec"):
+        if col not in df.columns:
+            df[col] = None
+
+    # Filter to requested status and skip rows with no valid path
+    filtered = df[
+        (df["status"] == status_filter)
+        & (df["path"].notna())
+        & (df["path"].astype(str).str.strip() != "")
+    ]
 
     if filtered.empty:
         print(f"No captures with status='{status_filter}' found in {manifest_path}")
@@ -769,12 +797,12 @@ def listen_to_captures(
         )
         speech_pct = row.get("vad_speech_ratio")
         music_score = row.get("vad_music_score")
-        if speech_pct not in (None, ""):
+        if pd.notna(speech_pct):
             try:
                 label += f" | speech={float(speech_pct):.1%}"
             except (ValueError, TypeError):
                 pass
-        if music_score not in (None, ""):
+        if pd.notna(music_score):
             try:
                 label += f" | music_score={float(music_score):.2f}"
             except (ValueError, TypeError):
@@ -825,10 +853,10 @@ def main_radio_capture() -> None:
             max_retries=3,
             min_retry_delay_seconds=30,
             max_retry_delay_seconds=120,
-            music_rejection_enabled=True,  # Gate 2: spectral music rejection
-            max_music_flatness=0.05,
-            music_tempo_min_bpm=70.0,
-            max_flatness_with_tempo=0.10,
+            music_rejection_enabled=True,
+            max_music_flatness=0.03,          # very tonal → clearly music
+            max_music_flatness_dynamic=0.06,  # moderate + steady → music
+            max_music_flatness_std=0.02,      # "steady" = std below this
         ),
     )
 
